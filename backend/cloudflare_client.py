@@ -69,6 +69,7 @@ class CloudflareAIClient:
             "messages": api_messages,
             "max_tokens": max_tokens,
             "temperature": temperature,
+            "model": model,  # Required for @cf/ models
         }
 
         url = f"{self.BASE_URL}/v1/chat/completions"
