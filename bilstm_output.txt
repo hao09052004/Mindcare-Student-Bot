@@ -1,0 +1,330 @@
+
+--- Cell 0 ---
+import os
+import pandas as pd
+from sklearn.model_selection import train_test_split
+
+WORK_DIR = "/kaggle/working"
+DATA_PATH = "/kaggle/input/datasets/trngtnhng/chatbotdat/router_dataset_vi_clean.csv"  # chỉnh đúng tên dataset bên Input
+
+LABEL_NAMES = [
+    "normal_support",
+    "school_stress",
+    "relationship_issue",
+    "self_care",
+    "high_risk",
+]
+SEED = 42
+
+df = pd.read_csv(DATA_PATH)
+df = df[df["label"].isin(LABEL_NAMES)].dropna(subset=["text","label"])
+df = df[df["text"].astype(str).str.len() >= 5].reset_index(drop=True)
+df["label_id"] = df["label"].map({l: i for i, l in enumerate(LABEL_NAMES)})
+
+X, y = df["text"].astype(str), df["label_id"]
+
+X_train, X_tmp, y_train, y_tmp = train_test_split(
+    X, y, test_size=0.20, stratify=y, random_state=SEED
+)
+X_val, X_test, y_val, y_test = train_test_split(
+    X_tmp, y_tmp, test_size=0.50, stratify=y_tmp, random_state=SEED
+)
+
+for split_name, xs, ys in [("train", X_train, y_train),
+                            ("val",   X_val,   y_val),
+                            ("test",  X_test,  y_test)]:
+    out = pd.DataFrame({"text": xs.values, "label_id": ys.values})
+    out["label"] = out["label_id"].map({i: l for i, l in enumerate(LABEL_NAMES)})
+    path = os.path.join(WORK_DIR, f"router_{split_name}.csv")
+    out.to_csv(path, index=False, encoding="utf-8-sig")
+    print(f"[{split_name}] {len(out)} → {path}")
+--- Cell 1 ---
+# ============================================================
+# Cell tiếp theo — Load splits
+# ============================================================
+import pandas as pd
+
+WORK_DIR = "/kaggle/working"
+
+train = pd.read_csv(f"{WORK_DIR}/router_train.csv")
+val   = pd.read_csv(f"{WORK_DIR}/router_val.csv")
+test  = pd.read_csv(f"{WORK_DIR}/router_test.csv")
+
+print(train.shape, val.shape, test.shape)
+train.head()
+--- Cell 2 ---
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+import tensorflow as tf
+
+from tensorflow.keras import layers, callbacks, models
+from sklearn.utils.class_weight import compute_class_weight
+from sklearn.metrics import (
+    classification_report, confusion_matrix,
+    accuracy_score, f1_score,
+)
+
+print("TF version:", tf.__version__)
+gpus = tf.config.list_physical_devices("GPU")
+if gpus:
+    for g in gpus:
+        tf.config.experimental.set_memory_growth(g, True)
+print("GPUs available:", len(gpus))
+--- Cell 3 ---
+WORK_DIR        = "/kaggle/working"
+SEED            = 42
+
+LABEL_NAMES     = [
+    "normal_support",
+    "school_stress",
+    "relationship_issue",
+    "self_care",
+    "high_risk",
+]
+NUM_CLASSES     = len(LABEL_NAMES)
+
+VOCAB_SIZE      = 30000
+MAX_SEQ_LEN     = 128
+EMBED_DIM       = 128
+LSTM_UNITS      = 128
+DENSE_UNITS     = 128
+DROPOUT_RATE    = 0.3
+
+BATCH_SIZE      = 64
+EPOCHS          = 30
+LEARNING_RATE   = 1e-3
+HIGH_RISK_BOOST = 2.0
+
+tf.random.set_seed(SEED)
+np.random.seed(SEED)
+print("✅ Config OK")
+--- Cell 4 ---
+train = pd.read_csv(f"{WORK_DIR}/router_train.csv")
+val   = pd.read_csv(f"{WORK_DIR}/router_val.csv")
+test  = pd.read_csv(f"{WORK_DIR}/router_test.csv")
+
+X_train = train["text"].astype(str).values
+y_train = train["label_id"].values
+X_val   = val["text"].astype(str).values
+y_val   = val["label_id"].values
+X_test  = test["text"].astype(str).values
+y_test  = test["label_id"].values
+
+print(f"Train: {len(X_train)} | Val: {len(X_val)} | Test: {len(X_test)}")
+print(train["label"].value_counts())
+--- Cell 5 ---
+vectorizer = layers.TextVectorization(
+    max_tokens=VOCAB_SIZE,
+    output_mode="int",
+    output_sequence_length=MAX_SEQ_LEN,
+    standardize="lower_and_strip_punctuation",
+)
+
+vectorizer.adapt(X_train)
+print("Vocab size:", len(vectorizer.get_vocabulary()))
+
+def make_dataset(texts, labels, shuffle=False):
+    ds = tf.data.Dataset.from_tensor_slices((texts, labels))
+    if shuffle:
+        ds = ds.shuffle(buffer_size=len(texts), seed=SEED)
+    ds = ds.batch(BATCH_SIZE).map(
+        lambda x, y: (vectorizer(x), y),
+        num_parallel_calls=tf.data.AUTOTUNE,
+    ).prefetch(tf.data.AUTOTUNE)
+    return ds
+
+train_ds = make_dataset(X_train, y_train, shuffle=True)
+val_ds   = make_dataset(X_val, y_val)
+test_ds  = make_dataset(X_test, y_test)
+
+print("✅ tf.data ready")
+--- Cell 6 ---
+cw = compute_class_weight(
+    class_weight="balanced",
+    classes=np.unique(y_train),
+    y=y_train
+)
+class_weight = dict(enumerate(cw))
+
+hr_idx = LABEL_NAMES.index("high_risk")
+class_weight[hr_idx] *= HIGH_RISK_BOOST
+
+print("Class weights:")
+for i, name in enumerate(LABEL_NAMES):
+    print(f"{name:<22}: {class_weight[i]:.4f}")
+--- Cell 7 ---
+model = models.Sequential([
+    layers.Embedding(VOCAB_SIZE, EMBED_DIM, mask_zero=True),
+    layers.Bidirectional(
+        layers.LSTM(LSTM_UNITS, return_sequences=True)
+    ),
+    layers.GlobalMaxPooling1D(),
+    layers.Dense(DENSE_UNITS, activation="relu"),
+    layers.Dropout(DROPOUT_RATE),
+    layers.Dense(NUM_CLASSES, activation="softmax"),
+], name="BiLSTM_SafetyRouter")
+
+model.compile(
+    optimizer=tf.keras.optimizers.Adam(learning_rate=LEARNING_RATE),
+    loss="sparse_categorical_crossentropy",
+    metrics=["accuracy"],
+)
+
+model.summary()
+--- Cell 8 ---
+cbs = [
+    callbacks.EarlyStopping(
+        monitor="val_accuracy",
+        patience=5,
+        restore_best_weights=True,
+        verbose=1
+    ),
+    callbacks.ModelCheckpoint(
+        filepath=f"{WORK_DIR}/03_bilstm_best.keras",
+        monitor="val_accuracy",
+        save_best_only=True,
+        verbose=1
+    ),
+    callbacks.ReduceLROnPlateau(
+        monitor="val_loss",
+        factor=0.5,
+        patience=3,
+        min_lr=1e-6,
+        verbose=1
+    )
+]
+
+print("✅ Callbacks ready")
+--- Cell 9 ---
+history = model.fit(
+    train_ds,
+    validation_data=val_ds,
+    epochs=EPOCHS,
+    class_weight=class_weight,
+    callbacks=cbs,
+)
+
+print("Best val_accuracy:", max(history.history["val_accuracy"]))
+--- Cell 10 ---
+fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+
+axes[0].plot(history.history["loss"], label="train")
+axes[0].plot(history.history["val_loss"], label="val")
+axes[0].set_title("Loss")
+axes[0].set_xlabel("Epoch")
+axes[0].legend()
+
+axes[1].plot(history.history["accuracy"], label="train")
+axes[1].plot(history.history["val_accuracy"], label="val")
+axes[1].set_title("Accuracy")
+axes[1].set_xlabel("Epoch")
+axes[1].legend()
+
+plt.suptitle("BiLSTM Training Curves")
+plt.tight_layout()
+plt.savefig(f"{WORK_DIR}/03_bilstm_curves.png", dpi=150, bbox_inches="tight")
+plt.show()
+--- Cell 11 ---
+y_pred_prob = model.predict(test_ds, verbose=1)
+y_pred = np.argmax(y_pred_prob, axis=1)
+
+acc    = accuracy_score(y_test, y_pred)
+mac_f1 = f1_score(y_test, y_pred, average="macro")
+wgt_f1 = f1_score(y_test, y_pred, average="weighted")
+
+report_dict = classification_report(
+    y_test, y_pred,
+    target_names=LABEL_NAMES,
+    digits=3,
+    output_dict=True
+)
+hr_recall = report_dict["high_risk"]["recall"]
+
+print("=" * 60)
+print("BiLSTM — Test Set")
+print("=" * 60)
+print(f"Accuracy          : {acc:.4f}")
+print(f"Macro F1          : {mac_f1:.4f}")
+print(f"Weighted F1       : {wgt_f1:.4f}")
+print(f"Recall(high_risk) : {hr_recall:.4f}")
+print()
+print(classification_report(y_test, y_pred, target_names=LABEL_NAMES, digits=3))
+
+if hr_recall >= 0.90:
+    print("✅ PASS safety gate: Recall(high_risk) >= 0.90")
+else:
+    print("⚠️  Chưa đạt safety gate, cần tune thêm")
+--- Cell 12 ---
+cm = confusion_matrix(y_test, y_pred)
+
+plt.figure(figsize=(7, 6))
+sns.heatmap(
+    cm, annot=True, fmt="d", cmap="Purples",
+    xticklabels=LABEL_NAMES,
+    yticklabels=LABEL_NAMES
+)
+plt.title("Confusion Matrix — BiLSTM")
+plt.xlabel("Predicted")
+plt.ylabel("True")
+plt.xticks(rotation=25, ha="right")
+plt.tight_layout()
+plt.savefig(f"{WORK_DIR}/03_cm_bilstm.png", dpi=150, bbox_inches="tight")
+plt.show()
+--- Cell 13 ---
+import pandas as pd
+
+pd.DataFrame([{
+    "model": "BiLSTM (TF)",
+    "accuracy": acc,
+    "macro_f1": mac_f1,
+    "weighted_f1": wgt_f1,
+    "high_risk_recall": hr_recall,
+}]).to_csv(f"{WORK_DIR}/03_bilstm_metrics.csv", index=False)
+
+# Lưu dạng Keras file
+model.save(f"{WORK_DIR}/03_bilstm_final.keras")
+
+print("✅ Saved: 03_bilstm_metrics.csv")
+print("✅ Saved model: 03_bilstm_final.keras")
+--- Cell 14 ---
+# ===== Tạo export_model nhận trực tiếp string =====
+text_input = tf.keras.Input(shape=(1,), dtype=tf.string, name="text_input")
+
+# Cho TextVectorization xử lý text → sequence int
+x = vectorizer(text_input)
+
+# Cho BiLSTM model xử lý tiếp
+x = model(x)
+
+export_model = tf.keras.Model(
+    inputs=text_input,
+    outputs=x,
+    name="BiLSTM_SafetyRouter_Export",
+)
+
+export_model.summary()
+
+# ===== Lưu export_model dạng .keras =====
+EXPORT_PATH = f"{WORK_DIR}/03_bilstm_export.keras"
+export_model.save(EXPORT_PATH)
+
+print("✅ Saved export model:", EXPORT_PATH)
+--- Cell 15 ---
+test_texts = test["text"].astype(str).values
+wrong_idx = np.where(y_pred != y_test)[0]
+
+print(f"Tổng số mẫu dự đoán sai: {len(wrong_idx)} / {len(y_test)}")
+
+hr_id = LABEL_NAMES.index("high_risk")
+priority_wrong = [i for i in wrong_idx if y_test[i] == hr_id or y_pred[i] == hr_id]
+
+show_idx = priority_wrong[:5] if len(priority_wrong) >= 5 else list(wrong_idx[:5])
+
+print("\n--- 5 lỗi tiêu biểu ---")
+for i in show_idx:
+    print(f"\n[{i}]")
+    print("Text   :", test_texts[i][:200])
+    print("True   :", LABEL_NAMES[y_test[i]])
+    print("Predict:", LABEL_NAMES[y_pred[i]])

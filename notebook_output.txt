@@ -1,0 +1,937 @@
+
+--- Cell 0 ---
+# =====================================================
+# Notebook 5
+# Cell 1 - Install Packages
+# =====================================================
+
+!pip -q install -U \
+transformers \
+datasets \
+sentencepiece \
+accelerate \
+rouge-score \
+sacrebleu
+--- Cell 1 ---
+# =====================================================
+# Cell 2 - Imports
+# =====================================================
+
+import os
+import gc
+import random
+import warnings
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+import tensorflow as tf
+
+import torch
+
+from sklearn.model_selection import train_test_split
+
+from datasets import Dataset
+
+from transformers import (
+    AutoTokenizer,
+    AutoModelForSeq2SeqLM,
+    DataCollatorForSeq2Seq,
+    Seq2SeqTrainer,
+    Seq2SeqTrainingArguments
+)
+
+warnings.filterwarnings("ignore")
+--- Cell 2 ---
+# =====================================================
+# Cell 3 - Config
+# =====================================================
+
+SEED = 42
+
+MODEL_NAME = "google/mt5-small"
+
+MAX_INPUT_LENGTH = 128
+MAX_TARGET_LENGTH = 128
+
+TRAIN_BATCH_SIZE = 8
+VALID_BATCH_SIZE = 8
+
+GRADIENT_ACCUMULATION = 2
+
+LEARNING_RATE = 3e-4
+
+WEIGHT_DECAY = 0.01
+
+NUM_EPOCHS = 5
+
+OUTPUT_DIR = "./mt5_output"
+
+os.makedirs(
+    OUTPUT_DIR,
+    exist_ok=True
+)
+
+print("Config loaded.")
+--- Cell 3 ---
+# =====================================================
+# Cell 4 - Reproducibility
+# =====================================================
+
+def seed_everything(seed=42):
+
+    random.seed(seed)
+
+    np.random.seed(seed)
+
+    tf.random.set_seed(seed)
+
+    torch.manual_seed(seed)
+
+    torch.cuda.manual_seed_all(seed)
+
+seed_everything(SEED)
+
+print("Seed =", SEED)
+--- Cell 4 ---
+# =====================================================
+# Cell 5 - Load Dataset
+# =====================================================
+
+import pandas as pd
+
+df1 = pd.read_parquet(
+    "/kaggle/input/models/trngtnhng/datbilstm/keras/default/4/train-00000-of-00002.parquet"
+)
+
+df2 = pd.read_parquet(
+    "/kaggle/input/models/trngtnhng/datbilstm/keras/default/4/train-00001-of-00002.parquet"
+)
+
+df = pd.concat(
+    [df1, df2],
+    ignore_index=True
+)
+
+df = df[["question", "answer"]]
+
+df = df.dropna()
+
+df["question"] = df["question"].astype(str)
+
+df["answer"] = df["answer"].astype(str)
+
+print(df.shape)
+
+df.head()
+--- Cell 5 ---
+# =====================================================
+# Cell 6 - Load Router
+# =====================================================
+
+ROUTER_PATH = "/kaggle/input/models/trngtnhng/datbilstm/keras/default/4/03_bilstm_export.keras"
+
+router = tf.keras.models.load_model(
+    ROUTER_PATH,
+    compile=False
+)
+
+router.summary()
+
+print("Router loaded.")
+--- Cell 6 ---
+# =====================================================
+# Cell 7 - Predict Route (Keras3 Safe Version)
+# =====================================================
+
+LABEL_NAMES = [
+    "normal_support",
+    "school_stress",
+    "relationship_issue",
+    "self_care",
+    "high_risk",
+]
+
+questions = df["question"].fillna("").astype(str).tolist()
+
+batch_size = 256
+
+route_ids = []
+
+print(f"Total samples: {len(questions):,}")
+
+for start in range(0, len(questions), batch_size):
+
+    batch = questions[start:start + batch_size]
+
+    batch = tf.constant(batch, dtype=tf.string)
+
+    batch = tf.expand_dims(batch, axis=-1)
+
+    logits = router(batch, training=False)
+
+    route_ids.extend(
+        np.argmax(
+            logits.numpy(),
+            axis=1
+        )
+    )
+
+    if start % 50000 == 0:
+        print(f"{start:,}/{len(questions):,}")
+
+df["route"] = [
+    LABEL_NAMES[i]
+    for i in route_ids
+]
+
+print(df["route"].value_counts())
+
+gc.collect()
+--- Cell 7 ---
+# =====================================================
+# Cell 8 - Remove High Risk
+# =====================================================
+
+df = df[df["route"] != "high_risk"].reset_index(drop=True)
+
+print(df.shape)
+
+print(df["route"].value_counts())
+--- Cell 8 ---
+# =====================================================
+# Cell 9 - Balance Dataset
+# =====================================================
+
+TARGET_PER_ROUTE = 25000
+
+balanced_df = (
+    df.groupby("route", group_keys=False)
+      .apply(
+          lambda x: x.sample(
+              min(len(x), TARGET_PER_ROUTE),
+              random_state=42
+          )
+      )
+      .reset_index(drop=True)
+)
+
+print(balanced_df.shape)
+
+print(balanced_df.route.value_counts())
+--- Cell 9 ---
+# =====================================================
+# Cell 10 - Train / Valid / Test
+# =====================================================
+
+train_df, temp_df = train_test_split(
+
+    balanced_df,
+
+    test_size=0.2,
+
+    random_state=42,
+
+    stratify=balanced_df["route"]
+
+)
+
+valid_df, test_df = train_test_split(
+
+    temp_df,
+
+    test_size=0.5,
+
+    random_state=42,
+
+    stratify=temp_df["route"]
+
+)
+
+print(train_df.shape)
+
+print(valid_df.shape)
+
+print(test_df.shape)
+--- Cell 10 ---
+# =====================================================
+# Cell 11 - Prompt Engineering
+# =====================================================
+
+def build_prompt(route, question):
+
+    return f"""Bạn là chatbot tư vấn tâm lý học đường.
+
+Danh mục: {route}
+
+Học sinh:
+
+{question}
+
+Trả lời:"""
+
+
+for data in [train_df, valid_df, test_df]:
+
+    data["input_text"] = data.apply(
+
+        lambda x: build_prompt(
+
+            x["route"],
+
+            x["question"]
+
+        ),
+
+        axis=1
+
+    )
+
+    data["target_text"] = data["answer"]
+--- Cell 11 ---
+# =====================================================
+# Cell 12 - Save CSV
+# =====================================================
+
+train_df.to_csv(
+
+    "mt5_train.csv",
+
+    index=False,
+
+    encoding="utf-8-sig"
+
+)
+
+valid_df.to_csv(
+
+    "mt5_valid.csv",
+
+    index=False,
+
+    encoding="utf-8-sig"
+
+)
+
+test_df.to_csv(
+
+    "mt5_test.csv",
+
+    index=False,
+
+    encoding="utf-8-sig"
+
+)
+
+print("Saved.")
+--- Cell 12 ---
+# =====================================================
+# Cell 13 - HF Dataset
+# =====================================================
+
+from datasets import Dataset
+
+train_dataset = Dataset.from_pandas(
+
+    train_df[
+        ["input_text", "target_text"]
+    ],
+
+    preserve_index=False
+
+)
+
+valid_dataset = Dataset.from_pandas(
+
+    valid_df[
+        ["input_text", "target_text"]
+    ],
+
+    preserve_index=False
+
+)
+
+test_dataset = Dataset.from_pandas(
+
+    test_df[
+        ["input_text", "target_text"]
+    ],
+
+    preserve_index=False
+
+)
+
+print(train_dataset)
+
+print(valid_dataset)
+
+print(test_dataset)
+--- Cell 13 ---
+# =====================================================
+# Cell 14 - Load mT5
+# =====================================================
+
+from transformers import AutoTokenizer
+from transformers import AutoModelForSeq2SeqLM
+
+MODEL_NAME = "google/mt5-small"
+
+print("Loading tokenizer...")
+
+tokenizer = AutoTokenizer.from_pretrained(
+    MODEL_NAME,
+    use_fast=False
+)
+
+print("Loading model...")
+
+model = AutoModelForSeq2SeqLM.from_pretrained(
+    MODEL_NAME
+)
+
+print("Done.")
+--- Cell 14 ---
+# =====================================================
+# Cell 15 - Tokenization
+# =====================================================
+
+MAX_INPUT_LENGTH = 128
+MAX_TARGET_LENGTH = 128
+
+
+def preprocess(example):
+
+    model_inputs = tokenizer(
+
+        example["input_text"],
+
+        max_length=MAX_INPUT_LENGTH,
+
+        truncation=True,
+
+        padding="max_length"
+
+    )
+
+    labels = tokenizer(
+
+        text_target=example["target_text"],
+
+        max_length=MAX_TARGET_LENGTH,
+
+        truncation=True,
+
+        padding="max_length"
+
+    )
+
+    model_inputs["labels"] = labels["input_ids"]
+
+    return model_inputs
+--- Cell 15 ---
+# =====================================================
+# Cell 16 - Tokenize Dataset
+# =====================================================
+
+train_tokenized = train_dataset.map(
+
+    preprocess,
+
+    batched=True,
+
+    remove_columns=train_dataset.column_names
+
+)
+
+valid_tokenized = valid_dataset.map(
+
+    preprocess,
+
+    batched=True,
+
+    remove_columns=valid_dataset.column_names
+
+)
+
+test_tokenized = test_dataset.map(
+
+    preprocess,
+
+    batched=True,
+
+    remove_columns=test_dataset.column_names
+
+)
+
+print(train_tokenized)
+--- Cell 16 ---
+# =====================================================
+# Cell 17 - Data Collator
+# =====================================================
+
+from transformers import DataCollatorForSeq2Seq
+
+data_collator = DataCollatorForSeq2Seq(
+
+    tokenizer=tokenizer,
+
+    model=model
+
+)
+
+print("Done.")
+--- Cell 17 ---
+# =====================================================
+# Cell 18 - Compute Metrics
+# =====================================================
+
+from rouge_score import rouge_scorer
+import numpy as np
+
+scorer = rouge_scorer.RougeScorer(
+    ["rouge1","rouge2","rougeL"],
+    use_stemmer=False
+)
+
+def compute_metrics(eval_preds):
+
+    preds, labels = eval_preds
+
+    if isinstance(preds, tuple):
+        preds = preds[0]
+
+    decoded_preds = tokenizer.batch_decode(
+        preds,
+        skip_special_tokens=True
+    )
+
+    labels = np.where(
+        labels != -100,
+        labels,
+        tokenizer.pad_token_id
+    )
+
+    decoded_labels = tokenizer.batch_decode(
+        labels,
+        skip_special_tokens=True
+    )
+
+    rouge1 = []
+    rouge2 = []
+    rougeL = []
+
+    for pred, label in zip(decoded_preds, decoded_labels):
+
+        score = scorer.score(label, pred)
+
+        rouge1.append(score["rouge1"].fmeasure)
+        rouge2.append(score["rouge2"].fmeasure)
+        rougeL.append(score["rougeL"].fmeasure)
+
+    return {
+
+        "rouge1": float(np.mean(rouge1)),
+        "rouge2": float(np.mean(rouge2)),
+        "rougeL": float(np.mean(rougeL))
+
+    }
+--- Cell 18 ---
+# =====================================================
+# Cell 19 - Training Arguments
+# =====================================================
+
+from transformers import Seq2SeqTrainingArguments
+
+training_args = Seq2SeqTrainingArguments(
+
+    output_dir="./mt5_output",
+
+    do_train=True,
+
+    do_eval=True,
+
+    eval_strategy="epoch",
+
+    save_strategy="epoch",
+
+    learning_rate=3e-4,
+
+    weight_decay=0.01,
+
+    warmup_steps=500,
+
+    per_device_train_batch_size=8,
+
+    per_device_eval_batch_size=8,
+
+    gradient_accumulation_steps=2,
+
+    num_train_epochs=5,
+
+    logging_steps=100,
+
+    save_total_limit=2,
+
+    predict_with_generate=True,
+
+    generation_max_length=128,
+
+    load_best_model_at_end=True,
+
+    metric_for_best_model="rougeL",
+
+    greater_is_better=True,
+
+    fp16=torch.cuda.is_available(),
+
+    report_to="none",
+
+    seed=42
+
+)
+
+print(training_args)
+--- Cell 19 ---
+# =====================================================
+# Cell 20 - Trainer
+# =====================================================
+
+from transformers import Seq2SeqTrainer
+
+trainer = Seq2SeqTrainer(
+
+    model=model,
+
+    args=training_args,
+
+    train_dataset=train_tokenized,
+
+    eval_dataset=valid_tokenized,
+
+    processing_class=tokenizer,
+
+    data_collator=data_collator,
+
+    compute_metrics=compute_metrics,
+
+)
+
+print("Trainer Ready!")
+--- Cell 20 ---
+# =====================================================
+# Cell 21 - Train mT5
+# =====================================================
+
+train_result = trainer.train()
+
+print("=" * 60)
+print("Training Finished!")
+print("=" * 60)
+
+trainer.save_model("./mt5_output/best_model")
+tokenizer.save_pretrained("./mt5_output/best_model")
+
+print("Model saved.")
+--- Cell 21 ---
+# =====================================================
+# Cell 22 - Validation Evaluation
+# =====================================================
+
+metrics = trainer.evaluate()
+
+print(metrics)
+--- Cell 22 ---
+# =====================================================
+# Cell 23 - Test Evaluation
+# =====================================================
+
+test_metrics = trainer.evaluate(test_tokenized)
+
+print("=" * 60)
+print("Test Metrics")
+print("=" * 60)
+
+for k, v in test_metrics.items():
+    print(f"{k:<25} : {v}")
+--- Cell 23 ---
+# =====================================================
+# Cell 24 - Learning Curve
+# =====================================================
+
+import pandas as pd
+import matplotlib.pyplot as plt
+
+history = pd.DataFrame(trainer.state.log_history)
+
+history.head()
+
+plt.figure(figsize=(10,5))
+
+train_loss = history.dropna(subset=["loss"])
+
+plt.plot(
+    train_loss["step"],
+    train_loss["loss"],
+    label="Train Loss"
+)
+
+if "eval_loss" in history.columns:
+
+    eval_loss = history.dropna(subset=["eval_loss"])
+
+    plt.plot(
+        eval_loss["step"],
+        eval_loss["eval_loss"],
+        label="Validation Loss"
+    )
+
+plt.xlabel("Training Step")
+plt.ylabel("Loss")
+plt.title("mT5 Fine-tuning")
+
+plt.grid(True)
+
+plt.legend()
+
+plt.show()
+--- Cell 24 ---
+# =====================================================
+# Cell 25 - Demo Inference
+# =====================================================
+
+def generate_answer(question, route):
+
+    prompt = f"""Bạn là chatbot tư vấn tâm lý học đường.
+
+Danh mục: {route}
+
+Học sinh:
+
+{question}
+
+Trả lời:"""
+
+    inputs = tokenizer(
+        prompt,
+        return_tensors="pt",
+        truncation=True,
+        max_length=128
+    )
+
+    if torch.cuda.is_available():
+        inputs = {k: v.cuda() for k, v in inputs.items()}
+        model.cuda()
+
+    output = model.generate(
+        **inputs,
+        max_length=128,
+        num_beams=4,
+        early_stopping=True
+    )
+
+    return tokenizer.decode(
+        output[0],
+        skip_special_tokens=True
+    )
+--- Cell 25 ---
+# =====================================================
+# Cell 26 - Save Metrics
+# =====================================================
+
+import pandas as pd
+
+metric_df = pd.DataFrame([test_metrics])
+
+metric_df.to_csv(
+    "mt5_metrics.csv",
+    index=False
+)
+
+metric_df
+--- Cell 26 ---
+# =====================================================
+# Cell 27 - Save Final Model
+# =====================================================
+
+trainer.save_model("mt5_final")
+
+tokenizer.save_pretrained("mt5_final")
+
+print("Saved!")
+--- Cell 27 ---
+import pandas as pd
+import matplotlib.pyplot as plt
+
+history = pd.DataFrame(trainer.state.log_history)
+
+history.head()
+--- Cell 28 ---
+# ============================================
+# Figure 1 - Training Loss
+# ============================================
+
+train_loss = history.dropna(subset=["loss"]).copy()
+
+# Moving Average
+train_loss["smooth"] = train_loss["loss"].rolling(
+    window=50,
+    min_periods=1
+).mean()
+
+plt.figure(figsize=(10,5))
+
+plt.plot(
+    train_loss["step"],
+    train_loss["smooth"],
+    linewidth=2
+)
+
+plt.title("Training Loss")
+
+plt.xlabel("Training Step")
+
+plt.ylabel("Loss")
+
+plt.grid(alpha=0.3)
+
+plt.tight_layout()
+
+plt.savefig(
+    "figure_train_loss.png",
+    dpi=300,
+    bbox_inches="tight"
+)
+
+plt.show()
+--- Cell 29 ---
+# ============================================
+# Figure 2 - Validation Loss
+# ============================================
+
+eval_loss = history.dropna(subset=["eval_loss"])
+
+plt.figure(figsize=(7,5))
+
+plt.plot(
+    eval_loss["epoch"],
+    eval_loss["eval_loss"],
+    marker="o",
+    linewidth=2
+)
+
+plt.title("Validation Loss")
+
+plt.xlabel("Epoch")
+
+plt.ylabel("Loss")
+
+plt.xticks(range(1,6))
+
+plt.grid(alpha=0.3)
+
+plt.tight_layout()
+
+plt.savefig(
+    "figure_validation_loss.png",
+    dpi=300,
+    bbox_inches="tight"
+)
+
+plt.show()
+--- Cell 30 ---
+# ============================================
+# Figure 3 - ROUGE
+# ============================================
+
+rouge = history.dropna(subset=["eval_rouge1"])
+
+plt.figure(figsize=(8,5))
+
+plt.plot(
+    rouge["epoch"],
+    rouge["eval_rouge1"],
+    marker="o",
+    label="ROUGE-1"
+)
+
+plt.plot(
+    rouge["epoch"],
+    rouge["eval_rouge2"],
+    marker="s",
+    label="ROUGE-2"
+)
+
+plt.plot(
+    rouge["epoch"],
+    rouge["eval_rougeL"],
+    marker="^",
+    label="ROUGE-L"
+)
+
+plt.title("ROUGE Score")
+
+plt.xlabel("Epoch")
+
+plt.ylabel("Score")
+
+plt.xticks(range(1,6))
+
+plt.grid(alpha=0.3)
+
+plt.legend()
+
+plt.tight_layout()
+
+plt.savefig(
+    "figure_rouge.png",
+    dpi=300,
+    bbox_inches="tight"
+)
+
+plt.show()
+--- Cell 31 ---
+# Train loss theo epoch lấy từ log cuối mỗi epoch
+train_epoch = (
+    history.dropna(subset=["loss"])
+           .groupby("epoch", as_index=False)
+           .last()[["epoch", "loss"]]
+           .rename(columns={"loss": "train_loss"})
+)
+
+eval_loss = history.dropna(subset=["eval_loss"])
+
+plt.figure(figsize=(8,5))
+
+plt.plot(
+    train_epoch["epoch"],
+    train_epoch["train_loss"],
+    marker="o",
+    linewidth=2,
+    label="Train"
+)
+
+plt.plot(
+    eval_loss["epoch"],
+    eval_loss["eval_loss"],
+    marker="s",
+    linewidth=2,
+    label="Validation"
+)
+
+plt.title("Training vs Validation Loss")
+
+plt.xlabel("Epoch")
+plt.ylabel("Loss")
+plt.xticks(range(1,6))
+plt.grid(alpha=0.3)
+plt.legend()
+plt.tight_layout()
+
+plt.savefig(
+    "figure_train_val.png",
+    dpi=300,
+    bbox_inches="tight"
+)
+
+plt.show()
