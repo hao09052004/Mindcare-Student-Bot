@@ -74,7 +74,9 @@ app.add_middleware(
         "http://localhost:3000",
         "https://*.vercel.app",
         "https://*.netlify.app",
-        "*",  # Allow all origins in development
+        "https://frontend-woad-two-10.vercel.app",
+        "https://frontend-8kbre0vp8-mindcare11.vercel.app",
+        "*",
     ],
     allow_credentials=True,
     allow_methods=["*"],
